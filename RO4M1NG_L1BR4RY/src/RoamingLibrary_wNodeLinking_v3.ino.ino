@@ -12,15 +12,17 @@
 
 // Constants for node linking
 const int MAX_PEERS = 20;
-const unsigned long BROADCAST_INTERVAL = 2000;
-const unsigned long PEER_TIMEOUT = 10000;
+const unsigned long BROADCAST_INTERVAL = 5000;     // Increased to reduce network congestion
+const unsigned long PEER_TIMEOUT = 15000;          // Increased to account for packet loss
+const unsigned long NODE_INFO_INTERVAL = 3000;     // Separate interval for node info broadcasts
 const int MAX_RETRY = 3;
 
 // Structure for sharing file information between nodes
-struct SharedFile {
+struct __attribute__((packed)) SharedFile {
     char filename[32];
     size_t filesize;
     uint8_t sourceNode[6];
+    uint8_t padding[2];  // Add padding to ensure 4-byte alignment
     char nodeSSID[32];
 };
 
@@ -37,6 +39,12 @@ struct SendStatus {
     bool success;
     int retryCount;
     unsigned long lastTry;
+};
+
+struct __attribute__((packed)) NodeInfo {
+    char ssid[32];
+    uint8_t mac[6];
+    uint8_t padding[2];  // Add padding to ensure 4-byte alignment
 };
 
 // Variables for node linking
@@ -102,13 +110,16 @@ void handleThreadAjax();
 void handleUpload();
 void handleFileUpload();
 void handleUploadPage();
-String formatTimestamp(unsigned long timestamp);
 void handleNodeFiles();
 void handlePortal();
+void broadcastNodeInfo();
+void checkPeerTimeouts();
+void updatePeerInfo(const uint8_t* mac, const char* ssid);
 void checkAndCleanupForum();
 void cleanupForum();
 void cleanupPosts();
 void removeDirectory(const char * path);
+String formatTimestamp(unsigned long timestamp);
 
 // Function to check if file is allowed
 bool isAllowedFile(const String& filename) {
@@ -152,63 +163,43 @@ bool captivePortal() {
 
 // ESP-NOW callback function for received data
 void onDataReceived(const uint8_t *mac, const uint8_t *data, int len) {
-    // Flash LED briefly to show data received
     digitalWrite(ledPin, HIGH);
     delay(50);
     digitalWrite(ledPin, LOW);
-   
-    if (len == sizeof(SharedFile)) {
+    
+    if (len == sizeof(NodeInfo)) {
+        NodeInfo nodeInfo;
+        memcpy(&nodeInfo, data, sizeof(NodeInfo));
+        updatePeerInfo(mac, nodeInfo.ssid);
+    }
+    else if (len == sizeof(SharedFile)) {
         SharedFile receivedFile;
         memcpy(&receivedFile, data, sizeof(SharedFile));
-       
-        Serial.print("Received data from MAC: ");
+        
+        Serial.print("Received file data from MAC: ");
         for (int i = 0; i < 6; i++) {
             Serial.print(mac[i], HEX);
             if (i < 5) Serial.print(":");
         }
         Serial.println();
-        Serial.println("Received file: " + String(receivedFile.filename) +
-                      " from node: " + String(receivedFile.nodeSSID));
-       
-        // Update peer's info
-        bool peerFound = false;
-        for (auto &peer : peers) {
-            if (memcmp(peer.mac, mac, 6) == 0) {
-                peer.lastSeen = millis();
-                peer.ssid = String(receivedFile.nodeSSID);
-                peerFound = true;
-                Serial.println("Updated existing peer: " + peer.ssid);
-                break;
-            }
-        }
-       
-        if (!peerFound) {
-            PeerInfo newPeer;
-            memcpy(newPeer.mac, mac, 6);
-            newPeer.lastSeen = millis();
-            newPeer.ssid = String(receivedFile.nodeSSID);
-            peers.push_back(newPeer);
-            Serial.println("Added new peer: " + newPeer.ssid);
-        }
-       
-        // Handle file info
+        
+        // Update peer info from file message as backup
+        updatePeerInfo(mac, receivedFile.nodeSSID);
+        
+        // Handle the received file info
         bool fileFound = false;
         for (auto &file : remoteFiles) {
             if (strcmp(file.filename, receivedFile.filename) == 0 &&
                 memcmp(file.sourceNode, receivedFile.sourceNode, 6) == 0) {
                 file = receivedFile;
                 fileFound = true;
-                Serial.println("Updated existing file: " + String(file.filename));
                 break;
             }
         }
-       
+        
         if (!fileFound) {
             remoteFiles.push_back(receivedFile);
-            Serial.println("Added new file: " + String(receivedFile.filename));
         }
-    } else {
-        Serial.println("Received data of unexpected length: " + String(len));
     }
 }
 
@@ -262,7 +253,6 @@ bool addPeer(uint8_t *mac) {
         return true;
     }
 
-
     if (esp_now_add_peer(mac, ESP_NOW_ROLE_COMBO, 1, NULL, 0) != 0) {
         Serial.println("Failed to add peer");
         return false;
@@ -273,10 +263,14 @@ bool addPeer(uint8_t *mac) {
 void setupWiFiAP() {
     Serial.println("\n--- Setting up WiFi Access Point ---");
     
+    // Clear existing WiFi configuration
+    WiFi.disconnect(true);  // true parameter disconnects and removes saved credentials
+    WiFi.persistent(false); // Prevent credentials from being stored in flash
+
     // Generate SSID
     randomSeed(analogRead(0));
-    int randomNum = random(0, 100);
-    AP_SSID = String(AP_SSID_BASE) + String(randomNum < 10 ? "0" : "") + String(randomNum);
+    int randomNum = random(0, 1000);
+    AP_SSID = String(AP_SSID_BASE) + String(randomNum < 100 ? "0" : "") + String(randomNum);
     Serial.println("Generated SSID: " + AP_SSID);
     
     // First, disconnect any existing connections
@@ -400,28 +394,73 @@ String getMacString(uint8_t* mac) {
     return String(macStr);
 }
 
-void updateNodeLinking() {
-    static unsigned long lastBroadcast = 0;
+void broadcastNodeInfo() {
+    NodeInfo nodeInfo;
+    strncpy(nodeInfo.ssid, AP_SSID.c_str(), sizeof(nodeInfo.ssid) - 1);
+    WiFi.macAddress(nodeInfo.mac);
+    
+    uint8_t broadcastMac[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+    esp_now_send(broadcastMac, (uint8_t*)&nodeInfo, sizeof(nodeInfo));
+}
+
+void updatePeerInfo(const uint8_t* mac, const char* ssid) {
+    bool peerFound = false;
     unsigned long currentTime = millis();
-   
-    // Clean up old peers periodically
+    
+    for (auto &peer : peers) {
+        if (memcmp(peer.mac, mac, 6) == 0) {
+            peer.lastSeen = currentTime;
+            peer.ssid = String(ssid);
+            peerFound = true;
+            Serial.printf("Updated peer: %s\n", ssid);
+            break;
+        }
+    }
+    
+    if (!peerFound && peers.size() < MAX_PEERS) {
+        PeerInfo newPeer;
+        memcpy(newPeer.mac, mac, 6);
+        newPeer.lastSeen = currentTime;
+        newPeer.ssid = String(ssid);
+        peers.push_back(newPeer);
+        Serial.printf("Added new peer: %s\n", ssid);
+    }
+}
+
+void checkPeerTimeouts() {
+    unsigned long currentTime = millis();
     peers.remove_if([currentTime](const PeerInfo &peer) {
         bool removing = (currentTime - peer.lastSeen) > PEER_TIMEOUT;
         if (removing) {
-            Serial.print("Removing inactive peer: ");
-            Serial.println(peer.ssid);
+            Serial.printf("Removing inactive peer: %s\n", peer.ssid.c_str());
         }
         return removing;
     });
-   
-    // Broadcast files periodically
+}
+
+void updateNodeLinking() {
+    static unsigned long lastBroadcast = 0;
+    static unsigned long lastNodeInfo = 0;
+    unsigned long currentTime = millis();
+    
+    // Check for peer timeouts
+    checkPeerTimeouts();
+    
+    // Broadcast node info
+    if (currentTime - lastNodeInfo >= NODE_INFO_INTERVAL) {
+        Serial.println("Broadcasting node info...");
+        broadcastNodeInfo();
+        lastNodeInfo = currentTime;
+    }
+    
+    // Broadcast files
     if (currentTime - lastBroadcast >= BROADCAST_INTERVAL) {
         Serial.println("Broadcasting files...");
         broadcastFiles();
         lastBroadcast = currentTime;
-       
+        
         // Log current peers
-        Serial.println("Current peers:");
+        Serial.println("\nCurrent peers:");
         for (const auto& peer : peers) {
             Serial.printf("SSID: %s, Last seen: %lus ago\n",
                          peer.ssid.c_str(),
